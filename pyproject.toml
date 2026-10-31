@@ -1,0 +1,19 @@
+[project]
+name = "learn-pandas-numpy"
+version = "1.0.0"
+description = "Companion pipeline for the Learn pandas & NumPy masterclass: vectorized arrays, validated joins, groupby and time series"
+readme = "README.md"
+license = "MIT"
+authors = [{ name = "The Learning Hub" }]
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=2.0",
+    "pandas>=2.2",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
