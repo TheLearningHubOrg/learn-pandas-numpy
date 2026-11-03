@@ -148,7 +148,7 @@ source .venv/bin/activate          # Windows: .venv\Scripts\activate
 
 # 2. Install the core stack plus optional accelerators
 python -m pip install --upgrade pip
-python -m pip install "pandas>=2.2" "numpy>=2.0" pyarrow pytest
+python -m pip install "pandas>=3.0" "numpy>=2.0" pyarrow pytest
 
 # 3. Confirm versions and the BLAS backend NumPy links against
 python -c "import pandas as pd, numpy as np; print(pd.__version__, np.__version__)"
@@ -242,13 +242,14 @@ learn-pandas-numpy/
 ├── tests/test_pipeline.py   # compares pandas output against a pure-Python reference
 ├── Dockerfile
 ├── pyproject.toml
-└── requirements.txt
+├── requirements.txt         # runtime: numpy, pandas
+└── requirements-dev.txt     # adds pytest
 ```
 
 ```bash
 # 1. Install dependencies into a local environment
 python -m venv .venv && source .venv/bin/activate
-python -m pip install -r requirements.txt
+python -m pip install -r requirements-dev.txt
 
 # 2. Run the report
 PYTHONPATH=src python -m pipeline data
@@ -422,7 +423,7 @@ print(window.base is base)                   # True
 # 3. Take an explicit copy when you need isolation
 safe = base[2:6].copy()
 safe[:] = 100
-print(base[2:6])                             # unchanged
+print(base[2:6])                             # still [-1 -1 -1 -1]: the copy never writes back
 
 # 4. Layout matters: iterate along the contiguous axis
 big = np.ones((4000, 4000))
@@ -665,9 +666,9 @@ Other pandas 3 changes worth knowing when migrating:
 1. **`SettingWithCopyWarning` is gone:** CoW makes the behaviour defined, so the warning no longer exists.
 2. **String dtype inference:** text columns come back as `str`, not `object`. Code that checks `dtype == object` needs updating.
 3. **`groupby(..., observed=True)`** is the default for categorical groupers, so unobserved category combinations no longer appear.
-4. **Offset aliases:** use `"ME"`, `"QE"`, `"YE"` for period ends and lowercase `"h"`, `"min"`, `"s"`. The old `"M"` and `"H"` spellings were deprecated in 2.2.
+4. **Offset aliases:** use `"ME"`, `"QE"`, `"YE"` for period ends and lowercase `"h"`, `"min"`, `"s"`. The old `"M"` and `"H"` spellings were deprecated in 2.2 and pandas 3 rejects them with `ValueError: Invalid frequency`.
 
-On pandas 2.2 you can opt in early with `pd.options.mode.copy_on_write = True` and fix every warning before upgrading.
+On pandas 2.2, first set `pd.options.mode.copy_on_write = "warn"`: it keeps the old behaviour but warns wherever the result would change under CoW. Fix those call sites, switch the option to `True`, run the tests, then upgrade.
 
 ### 3.5 Missing Data Done Right
 
@@ -1135,7 +1136,7 @@ daily["dod_change"] = daily["revenue"].diff()
 
 Rules that prevent the most common time series incidents:
 
-1. **Normalize to UTC at ingestion.** Mixed offsets in one column end up as `object` dtype or raise.
+1. **Normalize to UTC at ingestion.** `pd.to_datetime` on strings with mixed UTC offsets raises `ValueError` in pandas 3 unless you pass `utc=True`.
 2. **Localize with intent:** `tz_localize` attaches a zone to naive times, `tz_convert` moves aware times between zones. Use `ambiguous=` and `nonexistent=` to decide what happens around DST gaps and overlaps.
 3. **Be explicit about bucket edges:** `label=` and `closed=` decide whether a weekly bucket is named after its first or last day, and which boundary belongs to it.
 4. **Calendar logic belongs in local time:** "sales per local business day" requires converting before resampling, or midnight will fall in the wrong place.
@@ -1486,7 +1487,7 @@ docker run --rm -v "$PWD/data:/input:ro" learn-pandas-numpy /input
 > **Answer**: NumPy 1.x used value-based casting for scalars, so the result dtype could depend on the actual value of a Python number. NEP 50 makes promotion depend only on dtypes, with Python scalars treated as weak. `float32_array * 2.5` now stays `float32`, and `np.uint8(200) + 100` overflows in `uint8` instead of quietly promoting. Code that relied on silent upcasting can lose precision or overflow. The migration plan: run the test suite with warnings as errors, enable Ruff's `NPY201` rule for removed APIs, and add explicit `astype` calls wherever the needed width was previously implicit.
 
 #### Q7: Why is `np.linalg.inv(A) @ b` considered bad practice?
-> **Answer**: Forming the inverse costs about as much as a factorization and then adds a matrix-vector multiply, so it does more work. More importantly, it amplifies rounding error on ill-conditioned matrices, because the inverse's entries can be huge and cancel imperfectly. `np.linalg.solve` performs an LU factorization with partial pivoting and back-substitution, which is faster and more accurate. For repeated solves with the same matrix, factor once with `scipy.linalg.lu_factor` and reuse it. For over-determined systems, use `lstsq` or a QR decomposition instead of the normal equations, which square the condition number.
+> **Answer**: Computing the inverse runs the same LU factorization and then solves for all `n` columns of the identity, roughly three times the work of a single solve, before the extra matrix-vector multiply. More importantly, it amplifies rounding error on ill-conditioned matrices, because the inverse's entries can be huge and cancel imperfectly. `np.linalg.solve` performs an LU factorization with partial pivoting and back-substitution, which is faster and more accurate. For repeated solves with the same matrix, factor once with `scipy.linalg.lu_factor` and reuse it. For over-determined systems, use `lstsq` or a QR decomposition instead of the normal equations, which square the condition number.
 
 #### Q8: How do you make random number generation reproducible across parallel workers?
 > **Answer**: Avoid the legacy global state (`np.random.seed`), which is shared, not thread-safe in intent, and couples every library that touches it. Create a root `np.random.SeedSequence(seed)` and call `.spawn(n)` to derive one child per worker, then build each worker's `default_rng` from its child. Children are designed to produce statistically independent streams, unlike naive schemes such as `seed + worker_id`, which can produce correlated sequences. Log the root seed with every run so results can be reproduced exactly.
@@ -1495,7 +1496,7 @@ docker run --rm -v "$PWD/data:/input:ro" learn-pandas-numpy /input
 > **Answer**: Arithmetic and assignment between pandas objects match rows by index label, not position. The incident: a team computes a cleaned Series, sorts it or resets its index, then assigns it back with `df["score"] = cleaned`. Labels no longer line up, so values land on the wrong rows, or rows with no matching label become `NaN`, and nothing raises. Prevention: keep the index stable through a transformation chain, use `.to_numpy()` only when positional semantics are truly intended (and assert equal lengths), and add a row-level test that checks a few known ids end to end.
 
 #### Q10: What is Copy-on-Write and how does it change everyday pandas code?
-> **Answer**: Under CoW, the default and only mode in pandas 3, any object derived from another behaves as an independent copy. pandas still shares buffers lazily and copies a column only when one side is written to. Practical effects: `SettingWithCopyWarning` no longer exists; chained assignment like `df["a"][mask] = 0` never modifies `df`; and methods such as `rename`, `reset_index` and `astype` become cheap because untouched columns are shared. The single correct way to update a subset is `df.loc[mask, "a"] = 0`. Migration from 2.x: set `pd.options.mode.copy_on_write = True`, fix every chained assignment the warnings point to, then upgrade.
+> **Answer**: Under CoW, the default and only mode in pandas 3, any object derived from another behaves as an independent copy. pandas still shares buffers lazily and copies a column only when one side is written to. Practical effects: `SettingWithCopyWarning` no longer exists; chained assignment like `df["a"][mask] = 0` never modifies `df`; and methods such as `rename`, `reset_index` and `astype` become cheap because untouched columns are shared. The single correct way to update a subset is `df.loc[mask, "a"] = 0`. Migration from 2.x: on pandas 2.2 set `pd.options.mode.copy_on_write = "warn"`, fix every call site the warnings point to, run the suite with the option set to `True`, then upgrade.
 
 #### Q11: Why prefer reassignment over `inplace=True`?
 > **Answer**: `inplace=True` rarely saves memory, because most operations build a new result internally and then swap it in. It returns `None`, which breaks method chaining and causes bugs like `df = df.dropna(inplace=True)` setting `df` to `None`. Under Copy-on-Write, the non-inplace version is cheap anyway, because unchanged data is shared rather than copied. Reassignment also makes data flow explicit and easier to test. Most style guides now discourage `inplace`, and pandas has already removed it from several methods.
@@ -1543,7 +1544,7 @@ docker run --rm -v "$PWD/data:/input:ro" learn-pandas-numpy /input
 > **Answer**: Convert every instant to UTC at ingestion and store tz-aware UTC timestamps. Keep the original offset or zone in a separate column if the business needs local context. Convert to a local zone only for presentation and for calendar logic such as "per local business day", and do it before resampling so day boundaries fall at local midnight. Watch DST transitions: localizing naive local times can hit nonexistent times (spring forward) or ambiguous ones (fall back), so set `nonexistent=` and `ambiguous=` deliberately instead of accepting a failure at 2 a.m. twice a year.
 
 #### Q26: What is the difference between `resample` and `groupby` with `pd.Grouper`?
-> **Answer**: `resample` is a groupby specialized for a datetime index or column with regular calendar buckets. It also supports upsampling (`ffill`, `interpolate`) and creates empty buckets for periods with no data, which plain groupby does not. `groupby(pd.Grouper(key="ts", freq="ME"))` gives the same downsampling but composes with other keys, for example monthly revenue per region in one pass. A subtle difference is that `resample` makes empty periods explicit, so a month with no sales appears with a sum of 0. That is usually what reporting wants and what a plain groupby leaves out.
+> **Answer**: `resample` is a groupby specialized for a datetime index or column with regular calendar buckets, and it also supports upsampling (`ffill`, `interpolate`, `asfreq`). `groupby(pd.Grouper(key="ts", freq="ME"))` uses the same time binning, so on its own it also emits empty months with a sum of 0. The difference shows up when you combine keys: `groupby([pd.Grouper(key="ts", freq="ME"), "region"])` returns only the (month, region) pairs that have rows, and grouping on a derived key such as `ts.dt.to_period("M")` drops empty months entirely. When a report must list every period, use `resample` per entity or reindex against a full `pd.period_range` after aggregating.
 
 #### Q27: Count-based versus time-based rolling windows: when does the choice matter?
 > **Answer**: `rolling(7)` means the last seven rows, while `rolling("7D")` means everything within the last seven days of timestamps. On regular data with no gaps they agree. On irregular or gappy data they diverge sharply: after a weekend with no trades, a seven-row window may span two weeks. Time-based windows need a sorted `DatetimeIndex` (or `on=`) and handle irregular sampling correctly, so they are the right default for event data. Count-based windows suit fixed-frequency series where each row is one period. In either case, use `min_periods` to control how the start of the series is treated.
